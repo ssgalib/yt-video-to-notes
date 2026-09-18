@@ -7,7 +7,7 @@ The tool downloads a video with `yt-dlp`, extracts its chapter metadata, capture
 ## Features
 
 - Auto-detects chapters from the video metadata
-- Full-page slides: each frame fills a landscape A4 page edge-to-edge, with the chapter title in a caption bar
+- Full-page slides: each frame is scaled to fit a landscape A4 page (never cropped), with the chapter title in a caption bar
 - Cover page with the video title
 - Three capture modes: one frame per chapter, two per chapter (start + end), or every unique frame (ffmpeg scene detection)
 - Output defaults to `<video title>.pdf`
@@ -78,7 +78,7 @@ Creates `Discrete Math - 10.2.1 Graph Terminology.pdf` with a cover page and one
 
 1. **Metadata & download** — `yt-dlp --dump-json` reads the chapter list, then the video is downloaded to a temporary directory.
 2. **Screenshots** — `ffmpeg` grabs frames according to the selected `--capture` mode (chapter-end, chapter start+end, or every scene change).
-3. **PDF** — `reportlab` renders each frame as a full-page landscape slide (center-cropped to fill the page), with the chapter title in a caption bar, preceded by a cover page.
+3. **PDF** — `reportlab` renders each frame scaled to fit a full-page landscape slide (letterboxed on white, never cropped), with the chapter title in a caption bar, preceded by a cover page.
 
 The temporary directory is cleaned up automatically unless `--keep-video` is passed.
 

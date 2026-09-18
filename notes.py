@@ -233,10 +233,12 @@ class _Slide(Flowable):
         super().__init__()
         with PILImage.open(img_path) as im:
             iw, ih = im.size
-        # Scale to cover the whole page (full-bleed); overflow is clipped.
-        scale = max(pw / iw, ph / ih)
+        # Scale to fit the full frame inside the page (no cropping); the
+        # caption bar occupies the bottom strip.
+        avail_h = ph - bar_h
+        scale = min(pw / iw, avail_h / ih)
         self.img_x = (pw - iw * scale) / 2
-        self.img_y = (ph - ih * scale) / 2
+        self.img_y = bar_h + (avail_h - ih * scale) / 2
         self.img_w = iw * scale
         self.img_h = ih * scale
         self.img_path = img_path
@@ -251,6 +253,8 @@ class _Slide(Flowable):
     def draw(self):
         c = self.canv
         c.saveState()
+        c.setFillColor(colors.white)
+        c.rect(0, 0, self.pw, self.ph, fill=True, stroke=False)
         c.drawImage(self.img_path, self.img_x, self.img_y, width=self.img_w, height=self.img_h)
 
         c.setFillColor(colors.black)
