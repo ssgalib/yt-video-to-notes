@@ -15,6 +15,7 @@ Layout prompt examples:
 """
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -22,6 +23,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.request
 from pathlib import Path
 
 # ── PDF ──────────────────────────────────────────────────────────────────────
@@ -153,30 +155,87 @@ def _fmt_time(seconds: float) -> str:
 # 3. SCREENSHOT CAPTURE
 # ─────────────────────────────────────────────────────────────────────────────
 
-def capture_screenshots(video_path: str, chapters: list[dict], out_dir: str) -> list[dict]:
-    """
-    For each chapter, capture a frame 1 second before chapter end.
-    Returns chapters enriched with 'screenshot' key.
-    """
-    print("[2/3] Capturing screenshots…")
-    shots = []
-    for i, ch in enumerate(chapters):
-        end = ch["end_time"]
-        ts = max(ch["start_time"], end - 1.0)  # 1 s before end (floor at start)
-        img_path = os.path.join(out_dir, f"chapter_{i:03d}.jpg")
+def _extract_frame(video_path: str, ts: float, img_path: str) -> None:
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", str(ts),
+        "-i", video_path,
+        "-vframes", "1",
+        "-q:v", "2",
+        img_path,
+    ]
+    subprocess.run(cmd, capture_output=True, check=True)
 
-        cmd = [
-            "ffmpeg", "-y",
-            "-ss", str(ts),
-            "-i", video_path,
-            "-vframes", "1",
-            "-q:v", "2",
-            img_path,
-        ]
-        subprocess.run(cmd, capture_output=True, check=True)
-        print(f"  ✓ [{i+1}/{len(chapters)}] {ch['title']} @ {_fmt_time(ts)}")
-        shots.append({**ch, "screenshot": img_path, "ts": ts})
-    return shots
+
+def _scene_change_times(video_path: str, start: float, end: float, threshold: float) -> list[float]:
+    """Absolute timestamps where ffmpeg detects a scene change in [start, end)."""
+    cmd = [
+        "ffmpeg", "-ss", str(start), "-to", str(end), "-i", video_path,
+        "-vf", f"select='gt(scene,{threshold})',showinfo",
+        "-an", "-f", "null", "-",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    times = []
+    for line in result.stderr.splitlines():
+        m = re.search(r"pts_time:([0-9.]+)", line)
+        if m:
+            times.append(start + float(m.group(1)))
+    return times
+
+
+def capture_screenshots(
+    video_path: str,
+    chapters: list[dict],
+    out_dir: str,
+    capture: str = "chapter",
+    scene_threshold: float = 0.3,
+) -> list[dict]:
+    """
+    Captures frames for each chapter according to the capture mode.
+    Returns chapters grouped as {"title", "shots": [{"screenshot", "ts", "label"}]}.
+
+    Modes:
+      "chapter"  — 1 frame, 1s before chapter end.
+      "startend" — 2 frames per chapter: 1s after start and 1s before end.
+      "unique"   — every unique frame detected by ffmpeg scene detection.
+    """
+    print(f"[2/3] Capturing screenshots (mode: {capture})…")
+    result = []
+    for i, ch in enumerate(chapters):
+        start = float(ch["start_time"])
+        end = float(ch["end_time"])
+        shots = []
+
+        if capture == "startend":
+            ts_start = min(start + 1.0, end)
+            ts_end = max(end - 1.0, start)
+            if ts_end - ts_start < 1.0:
+                points = [(start + (end - start) / 2, None)]
+            else:
+                points = [(ts_start, "start"), (ts_end, "end")]
+        elif capture == "unique":
+            times = [start + 0.5] + _scene_change_times(video_path, start, end, scene_threshold)
+            times = sorted(set(round(t, 2) for t in times))
+            kept = []
+            for t in times:
+                if not kept or t - kept[-1] >= 1.5:
+                    kept.append(t)
+            points = [(t, None) for t in kept]
+        else:
+            points = [(max(start, end - 1.0), None)]
+
+        for j, (ts, label) in enumerate(points):
+            img_path = os.path.join(out_dir, f"chapter_{i:03d}_{j:02d}.jpg")
+            _extract_frame(video_path, ts, img_path)
+            tag = f" [{label}]" if label else ""
+            print(f"  ✓ [{i+1}/{len(chapters)}] {ch['title']}{tag} @ {_fmt_time(ts)}")
+            shots.append({"screenshot": img_path, "ts": ts, "label": label})
+
+        result.append({"title": ch["title"], "shots": shots})
+
+    total = sum(len(c["shots"]) for c in result)
+    print(f"  ✓ Captured {total} frame(s) total.")
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -191,7 +250,8 @@ def _img_size(path: str, max_w: float, max_h: float):
     return iw * ratio, ih * ratio
 
 
-def build_pdf(chapters_with_shots: list[dict], cfg: dict, output_path: str, video_title: str):
+def build_pdf(chapters_with_shots: list[dict], cfg: dict, output_path: str, video_title: str,
+              capture: str = "chapter"):
     """
     Assembles the PDF according to the parsed format config.
     """
@@ -260,41 +320,59 @@ def build_pdf(chapters_with_shots: list[dict], cfg: dict, output_path: str, vide
     story.append(Paragraph(video_title, header_style))
     story.append(Spacer(1, 0.5 * cm))
 
-    def make_cell(ch):
-        """Return a list of flowables for one chapter cell."""
-        cell = []
+    def make_shot_flowables(shot, per_img_h):
+        """Timestamp label (optional) + image for one captured frame."""
+        items = []
+        iw, ih = _img_size(shot["screenshot"], cell_w, per_img_h)
+        img = Image(shot["screenshot"], width=iw, height=ih)
+        if show_ts:
+            lbl = f"{shot['label']} " if shot.get("label") else ""
+            items.append(Paragraph(f"{lbl}@ {_fmt_time(shot['ts'])}", ts_style))
+        items.append(img)
+        return items
+
+    def make_stacked_cell(ch):
+        """One cell per chapter: title once, all shots stacked."""
+        per_img_h = img_max_h / max(1, len(ch["shots"]))
         title_para = Paragraph(ch["title"], title_style)
-        ts_para = Paragraph(f"@ {_fmt_time(ch['ts'])}", ts_style) if show_ts else None
-
-        iw, ih = _img_size(ch["screenshot"], cell_w, img_max_h)
-        img = Image(ch["screenshot"], width=iw, height=ih)
-
+        body = []
+        for shot in ch["shots"]:
+            body.extend(make_shot_flowables(shot, per_img_h))
         if cfg["title_above"]:
-            cell.append(title_para)
-            if ts_para:
-                cell.append(ts_para)
-            cell.append(img)
+            return [title_para] + body
+        return body + [title_para]
+
+    def make_frame_cell(ch, shot):
+        """One cell per frame: chapter title + timestamp repeated."""
+        title_para = Paragraph(ch["title"], title_style)
+        body = make_shot_flowables(shot, img_max_h)
+        if cfg["title_above"]:
+            return [title_para] + body
+        return body + [title_para]
+
+    # Build the flat list of cells (each a list of flowables)
+    cells = []
+    for ch in chapters_with_shots:
+        if capture == "unique":
+            for shot in ch["shots"]:
+                cells.append(make_frame_cell(ch, shot))
         else:
-            cell.append(img)
-            cell.append(title_para)
-            if ts_para:
-                cell.append(ts_para)
-        return cell
+            cells.append(make_stacked_cell(ch))
 
     if cols == 1:
-        for ch in chapters_with_shots:
-            for item in make_cell(ch):
+        for cell in cells:
+            for item in cell:
                 story.append(item)
             story.append(Spacer(1, 0.8 * cm))
     else:
         # Build rows of `cols` cells
-        rows = [chapters_with_shots[i:i+cols] for i in range(0, len(chapters_with_shots), cols)]
+        rows = [cells[i:i+cols] for i in range(0, len(cells), cols)]
         for row in rows:
             # Pad short rows
             while len(row) < cols:
                 row.append(None)
 
-            table_data = [[make_cell(ch) if ch else [] for ch in row]]
+            table_data = [[cell if cell else [] for cell in row]]
             col_widths = [cell_w + gap * (i < cols - 1) for i in range(cols)]
             tbl = Table(table_data, colWidths=col_widths)
             tbl.setStyle(TableStyle([
@@ -334,6 +412,16 @@ def main():
         help="Layout prompt (e.g. '2 columns, dark background, title above, timestamps')",
     )
     parser.add_argument("--output", "-o", default=None, help="Output PDF path (prompted if omitted)")
+    parser.add_argument(
+        "--capture",
+        choices=["chapter", "startend", "unique"],
+        default="chapter",
+        help="Which frames to capture (default: chapter)",
+    )
+    parser.add_argument(
+        "--scene-threshold", dest="scene_threshold", type=float, default=0.3,
+        help="Scene-detection sensitivity for --capture unique, 0-1 (lower = more frames)",
+    )
     parser.add_argument("--keep-video", action="store_true", help="Keep the downloaded video file")
     args = parser.parse_args()
 
@@ -350,14 +438,16 @@ def main():
     tmpdir = tempfile.mkdtemp(prefix="yt_chapters_")
     try:
         video_path, chapters = download_video(url, tmpdir)
-        chapters_with_shots = capture_screenshots(video_path, chapters, tmpdir)
+        chapters_with_shots = capture_screenshots(
+            video_path, chapters, tmpdir, capture=args.capture, scene_threshold=args.scene_threshold
+        )
         # Get video title for PDF header
         meta_result = subprocess.run(
             ["yt-dlp", "--get-title", "--no-download", "--no-playlist", url],
             capture_output=True, text=True
         )
         video_title = meta_result.stdout.strip() or "YouTube Video Chapters"
-        build_pdf(chapters_with_shots, cfg, output, video_title)
+        build_pdf(chapters_with_shots, cfg, output, video_title, capture=args.capture)
     finally:
         if args.keep_video:
             dest = Path(output).parent / Path(video_path).name

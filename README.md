@@ -45,7 +45,25 @@ If you omit the URL, the script will prompt for it and for the output filename.
 | ------ | ----------- |
 | `-f, --format` | Layout prompt string (see examples below) |
 | `-o, --output` | Output PDF path |
+| `--capture` | Frame selection mode: `chapter`, `startend`, or `unique` (default: `chapter`) |
+| `--scene-threshold` | Scene-detection sensitivity for `--capture unique`, 0–1 (lower = more frames, default: `0.3`) |
 | `--keep-video` | Keep the downloaded video in the output directory |
+
+### Capture modes
+
+| Mode | Behavior |
+| ---- | -------- |
+| `chapter` (default) | One frame per chapter, 1 second before the chapter ends |
+| `startend` | Two frames per chapter: 1 second after it starts and 1 second before it ends |
+| `unique` | Every unique frame per chapter, detected via ffmpeg scene detection (also keeps the chapter's opening frame) |
+
+```bash
+python notes.py <url> --capture startend
+python notes.py <url> --capture unique
+python notes.py <url> --capture unique --scene-threshold 0.2   # more sensitive
+```
+
+A lower `--scene-threshold` keeps more frames; a higher one keeps fewer.
 
 ### Layout prompt examples
 
@@ -66,7 +84,7 @@ python notes.py "https://www.youtube.com/watch?v=PDxUDYEE-Sk" -o graph_terminolo
 ## How it works
 
 1. **Metadata & download** — `yt-dlp --dump-json` reads the chapter list, then the video is downloaded to a temporary directory.
-2. **Screenshots** — `ffmpeg` grabs a single frame 1 second before each chapter's end time.
+2. **Screenshots** — `ffmpeg` grabs frames according to the selected `--capture` mode (chapter-end, chapter start+end, or every scene change).
 3. **PDF** — `reportlab` lays out the images with chapter titles according to the parsed format prompt.
 
 The temporary directory is cleaned up automatically unless `--keep-video` is passed.
