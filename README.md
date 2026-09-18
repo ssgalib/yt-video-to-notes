@@ -45,7 +45,7 @@ If you omit the URL, the script will prompt for it and for the output filename.
 | ------ | ----------- |
 | `-f, --format` | Layout prompt string (see examples below) |
 | `-o, --output` | Output PDF path |
-| `--capture` | Frame selection mode: `chapter`, `startend`, or `unique` (default: `chapter`) |
+| `--capture` | Frame selection mode: `chapter`, `startend`, or `unique` (default: `startend`) |
 | `--scene-threshold` | Scene-detection sensitivity for `--capture unique`, 0–1 (lower = more frames, default: `0.3`) |
 | `--keep-video` | Keep the downloaded video in the output directory |
 
@@ -53,8 +53,8 @@ If you omit the URL, the script will prompt for it and for the output filename.
 
 | Mode | Behavior |
 | ---- | -------- |
-| `chapter` (default) | One frame per chapter, 1 second before the chapter ends |
-| `startend` | Two frames per chapter: 1 second after it starts and 1 second before it ends |
+| `chapter` | One frame per chapter, 1 second before the chapter ends |
+| `startend` (default) | Two frames per chapter: 1 second after it starts and 1 second before it ends |
 | `unique` | Every unique frame per chapter, detected via ffmpeg scene detection (also keeps the chapter's opening frame) |
 
 ```bash

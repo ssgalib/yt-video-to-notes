@@ -415,8 +415,8 @@ def main():
     parser.add_argument(
         "--capture",
         choices=["chapter", "startend", "unique"],
-        default="chapter",
-        help="Which frames to capture (default: chapter)",
+        default="startend",
+        help="Which frames to capture (default: startend)",
     )
     parser.add_argument(
         "--scene-threshold", dest="scene_threshold", type=float, default=0.3,
