@@ -1,4 +1,4 @@
-# yt-chapter-pdf
+# yt-video-to-notes
 
 Turn any YouTube video into a PDF of screenshot notes, one per chapter.
 
@@ -21,8 +21,8 @@ The tool downloads a video with `yt-dlp`, extracts its chapter metadata, capture
 ## Installation
 
 ```bash
-git clone https://github.com/ssgalib/yt-chapter-pdf.git
-cd yt-chapter-pdf
+git clone https://github.com/ssgalib/yt-video-to-notes.git
+cd yt-video-to-notes
 
 python -m venv .venv
 source .venv/bin/activate
