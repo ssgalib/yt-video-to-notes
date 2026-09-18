@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 """
-yt_chapter_pdf.py
+yt-video-to-notes
 -----------------
-Downloads a YouTube video, captures a screenshot 1 second before the end of
-each chapter (time block), then compiles them into a formatted PDF.
+Downloads a YouTube video, captures frames per chapter (start + end by default),
+and compiles them into a full-page slide PDF with a chapter-title caption.
 
 Usage:
-    python yt_chapter_pdf.py <youtube_url> [--format "<layout prompt>"] [--output output.pdf] [--keep-video]
+    python notes.py <youtube_url> [--capture startend] [--output notes.pdf]
 
-Layout prompt examples:
-    "2 columns, dark background, chapter title below each image, page numbers"
-    "1 column, white background, chapter title above image in bold, timestamps shown"
-    "3 columns, grey background, compact, no page numbers"
+Capture modes:
+    chapter   — 1 frame, 1s before each chapter ends
+    startend  — 2 frames per chapter: 1s after start, 1s before end (default)
+    unique    — every unique frame via ffmpeg scene detection
 """
 
 import argparse
-import base64
 import json
 import os
 import re
@@ -23,77 +22,23 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import urllib.request
 from pathlib import Path
 
 # ── PDF ──────────────────────────────────────────────────────────────────────
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
-from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-from reportlab.lib.units import cm, mm
-from reportlab.platypus import (
-    Image, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table,
-    TableStyle,
-)
+from reportlab.lib.units import cm
+from reportlab.platypus import BaseDocTemplate, Flowable, Frame, PageTemplate
 from PIL import Image as PILImage
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. FORMAT PROMPT PARSER
+# 1. VIDEO DOWNLOAD & CHAPTER EXTRACTION
 # ─────────────────────────────────────────────────────────────────────────────
 
-def parse_format_prompt(prompt: str) -> dict:
-    """
-    Parses a free-text layout prompt into a config dict.
-    Supports: columns (1/2/3), background colour, title placement,
-              timestamps, page numbers, page orientation.
-    """
-    p = prompt.lower()
-
-    # Columns
-    cols = 1
-    m = re.search(r'(\d)\s*col', p)
-    if m:
-        cols = max(1, min(3, int(m.group(1))))
-
-    # Background
-    bg = colors.white
-    if any(w in p for w in ['dark', 'black']):
-        bg = colors.HexColor('#1a1a2e')
-    elif any(w in p for w in ['grey', 'gray']):
-        bg = colors.HexColor('#f0f0f0')
-    elif 'blue' in p:
-        bg = colors.HexColor('#1b2a4a')
-
-    # Text colour (auto-contrast)
-    text_color = colors.black if bg == colors.white or bg == colors.HexColor('#f0f0f0') else colors.white
-
-    # Title placement
-    title_above = 'above' in p
-    title_below = not title_above  # default: below
-
-    # Extras
-    show_timestamps = 'timestamp' in p
-    show_page_numbers = 'no page' not in p  # default: show
-    compact = 'compact' in p
-    orient = landscape(A4) if 'landscape' in p else A4
-
-    return dict(
-        cols=cols, bg=bg, text_color=text_color,
-        title_above=title_above, title_below=title_below,
-        show_timestamps=show_timestamps,
-        show_page_numbers=show_page_numbers,
-        compact=compact, pagesize=orient,
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. VIDEO DOWNLOAD & CHAPTER EXTRACTION
-# ─────────────────────────────────────────────────────────────────────────────
-
-def download_video(url: str, out_dir: str) -> tuple[str, list[dict]]:
+def download_video(url: str, out_dir: str) -> tuple[str, list[dict], str]:
     """
     Downloads the video and extracts chapter metadata via yt-dlp.
-    Returns (video_path, chapters).
+    Returns (video_path, chapters, title).
     chapters = [{"title": str, "start_time": float, "end_time": float}, ...]
     """
     print(f"[1/3] Fetching metadata for: {url}")
@@ -141,7 +86,7 @@ def download_video(url: str, out_dir: str) -> tuple[str, list[dict]]:
         raise FileNotFoundError("yt-dlp did not produce a video file.")
     video_file = str(matches[0])
     print(f"  ✓ Saved to: {video_file}")
-    return video_file, chapters
+    return video_file, chapters, title
 
 
 def _fmt_time(seconds: float) -> str:
@@ -242,159 +187,118 @@ def capture_screenshots(
 # 4. PDF GENERATION
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _img_size(path: str, max_w: float, max_h: float):
-    """Return (w, h) scaled to fit within max_w × max_h, preserving aspect."""
-    with PILImage.open(path) as im:
-        iw, ih = im.size
-    ratio = min(max_w / iw, max_h / ih)
-    return iw * ratio, ih * ratio
+def _safe_filename(name: str) -> str:
+    """Sanitize a string for use as a filename."""
+    name = re.sub(r'[\\/:*?"<>|]+', "_", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    return name or "notes"
 
 
-def build_pdf(chapters_with_shots: list[dict], cfg: dict, output_path: str, video_title: str,
-              capture: str = "chapter"):
+class _Cover(Flowable):
+    """A full-page cover showing the video title."""
+
+    def __init__(self, title: str, subtitle: str, pw: float, ph: float):
+        super().__init__()
+        self.title = title
+        self.subtitle = subtitle
+        self.pw = pw
+        self.ph = ph
+
+    def wrap(self, avail_w, avail_h):
+        return (self.pw, self.ph)
+
+    def draw(self):
+        c = self.canv
+        c.saveState()
+        c.setFillColor(colors.white)
+        c.rect(0, 0, self.pw, self.ph, fill=True, stroke=False)
+
+        size = 28
+        while size > 12 and c.stringWidth(self.title, "Helvetica-Bold", size) > self.pw - 4 * cm:
+            size -= 1
+        c.setFillColor(colors.black)
+        c.setFont("Helvetica-Bold", size)
+        c.drawCentredString(self.pw / 2, self.ph / 2, self.title)
+
+        c.setFillColor(colors.HexColor("#666666"))
+        c.setFont("Helvetica", 14)
+        c.drawCentredString(self.pw / 2, self.ph / 2 - 1.5 * cm, self.subtitle)
+        c.restoreState()
+
+
+class _Slide(Flowable):
+    """A full-page slide: the captured frame edge-to-edge with a caption bar."""
+
+    def __init__(self, img_path: str, title: str, pw: float, ph: float, bar_h: float):
+        super().__init__()
+        with PILImage.open(img_path) as im:
+            iw, ih = im.size
+        # Scale to cover the whole page (full-bleed); overflow is clipped.
+        scale = max(pw / iw, ph / ih)
+        self.img_x = (pw - iw * scale) / 2
+        self.img_y = (ph - ih * scale) / 2
+        self.img_w = iw * scale
+        self.img_h = ih * scale
+        self.img_path = img_path
+        self.title = title
+        self.pw = pw
+        self.ph = ph
+        self.bar_h = bar_h
+
+    def wrap(self, avail_w, avail_h):
+        return (self.pw, self.ph)
+
+    def draw(self):
+        c = self.canv
+        c.saveState()
+        c.drawImage(self.img_path, self.img_x, self.img_y, width=self.img_w, height=self.img_h)
+
+        c.setFillColor(colors.black)
+        c.setFillAlpha(0.55)
+        c.rect(0, 0, self.pw, self.bar_h, fill=True, stroke=False)
+        c.setFillAlpha(1)
+
+        size = 16
+        while size > 7 and c.stringWidth(self.title, "Helvetica-Bold", size) > self.pw - 2 * cm:
+            size -= 1
+        c.setFillColor(colors.white)
+        c.setFont("Helvetica-Bold", size)
+        c.drawCentredString(self.pw / 2, (self.bar_h - size) / 2, self.title)
+        c.restoreState()
+
+
+class _SlideDeck(BaseDocTemplate):
+    """A document with a single full-bleed, zero-padding frame."""
+
+    def __init__(self, filename, **kw):
+        BaseDocTemplate.__init__(self, filename, **kw)
+        pw, ph = self.pagesize
+        frame = Frame(0, 0, pw, ph, id="main",
+                      leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0)
+        self.addPageTemplates([PageTemplate(id="page", frames=[frame])])
+
+
+def build_pdf(chapters_with_shots: list[dict], output_path: str, video_title: str):
     """
-    Assembles the PDF according to the parsed format config.
+    Assembles a full-page slide deck: one slide per captured frame,
+    preceded by a cover page. Landscape A4.
     """
     print("[3/3] Building PDF…")
-    pagesize = cfg["pagesize"]
-    pw, ph = pagesize
-    margin = 1.5 * cm if cfg["compact"] else 2 * cm
-    cols = cfg["cols"]
-    bg = cfg["bg"]
-    text_color = cfg["text_color"]
-    show_ts = cfg["show_timestamps"]
-    show_pg = cfg["show_page_numbers"]
+    pw, ph = landscape(A4)
+    bar_h = 1.2 * cm
 
-    # ── Styles ────────────────────────────────────────────────────────────────
-    styles = getSampleStyleSheet()
-    title_style = ParagraphStyle(
-        "ChTitle", parent=styles["Normal"],
-        fontSize=9 if cfg["compact"] else 11,
-        leading=13,
-        textColor=text_color,
-        fontName="Helvetica-Bold",
-        alignment=1,  # centre
-        spaceAfter=2 * mm,
-        spaceBefore=2 * mm,
-    )
-    ts_style = ParagraphStyle(
-        "TS", parent=styles["Normal"],
-        fontSize=7,
-        textColor=text_color,
-        fontName="Helvetica-Oblique",
-        alignment=1,
-        spaceAfter=1 * mm,
-    )
-    header_style = ParagraphStyle(
-        "Header", parent=styles["Heading1"],
-        fontSize=16,
-        textColor=text_color,
-        fontName="Helvetica-Bold",
-        alignment=1,
-        spaceAfter=4 * mm,
-    )
-
-    # ── Page background callback ──────────────────────────────────────────────
-    def on_page(canvas, doc):
-        canvas.saveState()
-        canvas.setFillColor(bg)
-        canvas.rect(0, 0, pw, ph, fill=True, stroke=False)
-        if show_pg:
-            canvas.setFont("Helvetica", 8)
-            canvas.setFillColor(text_color)
-            canvas.drawCentredString(pw / 2, margin / 2, f"Page {doc.page}")
-        canvas.restoreState()
-
-    # ── Layout calculations ───────────────────────────────────────────────────
-    usable_w = pw - 2 * margin
-    usable_h = ph - 2 * margin
-    gap = 0.5 * cm
-    cell_w = (usable_w - gap * (cols - 1)) / cols
-    img_max_h = usable_h * 0.35 if cols >= 2 else usable_h * 0.45
-
-    # ── Story ─────────────────────────────────────────────────────────────────
-    story = []
-
-    # Cover title
-    story.append(Spacer(1, 1 * cm))
-    story.append(Paragraph(video_title, header_style))
-    story.append(Spacer(1, 0.5 * cm))
-
-    def make_shot_flowables(shot, per_img_h):
-        """Timestamp label (optional) + image for one captured frame."""
-        items = []
-        iw, ih = _img_size(shot["screenshot"], cell_w, per_img_h)
-        img = Image(shot["screenshot"], width=iw, height=ih)
-        if show_ts:
-            lbl = f"{shot['label']} " if shot.get("label") else ""
-            items.append(Paragraph(f"{lbl}@ {_fmt_time(shot['ts'])}", ts_style))
-        items.append(img)
-        return items
-
-    def make_stacked_cell(ch):
-        """One cell per chapter: title once, all shots stacked."""
-        per_img_h = img_max_h / max(1, len(ch["shots"]))
-        title_para = Paragraph(ch["title"], title_style)
-        body = []
-        for shot in ch["shots"]:
-            body.extend(make_shot_flowables(shot, per_img_h))
-        if cfg["title_above"]:
-            return [title_para] + body
-        return body + [title_para]
-
-    def make_frame_cell(ch, shot):
-        """One cell per frame: chapter title + timestamp repeated."""
-        title_para = Paragraph(ch["title"], title_style)
-        body = make_shot_flowables(shot, img_max_h)
-        if cfg["title_above"]:
-            return [title_para] + body
-        return body + [title_para]
-
-    # Build the flat list of cells (each a list of flowables)
-    cells = []
+    slides = []
     for ch in chapters_with_shots:
-        if capture == "unique":
-            for shot in ch["shots"]:
-                cells.append(make_frame_cell(ch, shot))
-        else:
-            cells.append(make_stacked_cell(ch))
+        for shot in ch["shots"]:
+            slides.append((shot["screenshot"], ch["title"]))
 
-    if cols == 1:
-        for cell in cells:
-            for item in cell:
-                story.append(item)
-            story.append(Spacer(1, 0.8 * cm))
-    else:
-        # Build rows of `cols` cells
-        rows = [cells[i:i+cols] for i in range(0, len(cells), cols)]
-        for row in rows:
-            # Pad short rows
-            while len(row) < cols:
-                row.append(None)
+    story = [_Cover(video_title, f"{len(slides)} slide{'s' if len(slides) != 1 else ''}", pw, ph)]
+    for img_path, title in slides:
+        story.append(_Slide(img_path, title, pw, ph, bar_h))
 
-            table_data = [[cell if cell else [] for cell in row]]
-            col_widths = [cell_w + gap * (i < cols - 1) for i in range(cols)]
-            tbl = Table(table_data, colWidths=col_widths)
-            tbl.setStyle(TableStyle([
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("ALIGN",  (0, 0), (-1, -1), "CENTER"),
-                ("LEFTPADDING",  (0, 0), (-1, -1), 0),
-                ("RIGHTPADDING", (0, 0), (-1, -1), gap),
-                ("TOPPADDING",   (0, 0), (-1, -1), 0),
-                ("BOTTOMPADDING",(0, 0), (-1, -1), 0),
-            ]))
-            story.append(tbl)
-            story.append(Spacer(1, 0.6 * cm))
-
-    # ── Build ─────────────────────────────────────────────────────────────────
-    doc = SimpleDocTemplate(
-        output_path,
-        pagesize=pagesize,
-        leftMargin=margin, rightMargin=margin,
-        topMargin=margin, bottomMargin=margin,
-    )
-    doc.build(story, onFirstPage=on_page, onLaterPages=on_page)
-    print(f"  ✓ PDF saved: {output_path}")
+    doc = _SlideDeck(output_path, pagesize=landscape(A4), title=video_title)
+    doc.build(story)
+    print(f"  ✓ PDF saved: {output_path} ({len(slides)} slide(s))")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -403,15 +307,13 @@ def build_pdf(chapters_with_shots: list[dict], cfg: dict, output_path: str, vide
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Download a YouTube video and create a chapter-screenshot PDF."
+        description="Download a YouTube video and create a full-page slide PDF from its chapter screenshots."
     )
     parser.add_argument("url", nargs="?", help="YouTube video URL (prompted if omitted)")
     parser.add_argument(
-        "--format", "-f", dest="fmt",
-        default="1 column, white background, chapter title below image, page numbers",
-        help="Layout prompt (e.g. '2 columns, dark background, title above, timestamps')",
+        "--output", "-o", default=None,
+        help="Output PDF path (default: <video title>.pdf)",
     )
-    parser.add_argument("--output", "-o", default=None, help="Output PDF path (prompted if omitted)")
     parser.add_argument(
         "--capture",
         choices=["chapter", "startend", "unique"],
@@ -428,28 +330,19 @@ def main():
     url = args.url or input("YouTube video URL: ").strip()
     if not url:
         sys.exit("No URL provided.")
-    output = args.output or input("Output file name (e.g. my_notes.pdf): ").strip()
-    if not output:
-        output = "chapters.pdf"
 
-    cfg = parse_format_prompt(args.fmt)
-    print(f"Layout config: {cfg}\n")
-
+    output = args.output
     tmpdir = tempfile.mkdtemp(prefix="yt_chapters_")
     try:
-        video_path, chapters = download_video(url, tmpdir)
+        video_path, chapters, video_title = download_video(url, tmpdir)
         chapters_with_shots = capture_screenshots(
             video_path, chapters, tmpdir, capture=args.capture, scene_threshold=args.scene_threshold
         )
-        # Get video title for PDF header
-        meta_result = subprocess.run(
-            ["yt-dlp", "--get-title", "--no-download", "--no-playlist", url],
-            capture_output=True, text=True
-        )
-        video_title = meta_result.stdout.strip() or "YouTube Video Chapters"
-        build_pdf(chapters_with_shots, cfg, output, video_title, capture=args.capture)
+        if not output:
+            output = f"{_safe_filename(video_title)}.pdf"
+        build_pdf(chapters_with_shots, output, video_title)
     finally:
-        if args.keep_video:
+        if args.keep_video and output:
             dest = Path(output).parent / Path(video_path).name
             shutil.copy2(video_path, dest)
             print(f"Video kept at: {dest}")
